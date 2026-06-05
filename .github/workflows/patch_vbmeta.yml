@@ -1,10 +1,14 @@
-name: Patch VBMeta
+name: Patch All VBMeta - Tecno KM4 SPRD
 
 on:
   workflow_dispatch:
     inputs:
+      FIRMWARE_URL:
+        description: 'URL directe vers le fichier firmware .zip (optionnel si déjà présent dans le repo)'
+        required: false
+        default: ''
       ARCHITECTURE:
-        description: 'Architecture'
+        description: 'Architecture du binaire de patch'
         required: true
         default: 'x86_64'
         type: choice
@@ -12,46 +16,163 @@ on:
         - x86_64
         - x86
         - arm64-v8a
-        - armaebi-v7a
+        - armeabi-v7a
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  patch_vbmeta:
     if: github.event.repository.owner.id == github.event.sender.id
     runs-on: ubuntu-latest
     steps:
- 
+
     - name: Check Out
-      uses: actions/checkout@v3.1.0
-      
-    - name: Operating System Information
+      uses: actions/checkout@v4
+
+    - name: System Information
+      run: uname -a && lsb_release -a
+
+    - name: Install Dependencies
       run: |
-        uname -a
-        
-    - name: Patch File Information
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq unzip 7zip wget
+
+    - name: Download Firmware (if URL provided)
+      if: ${{ github.event.inputs.FIRMWARE_URL != '' }}
       run: |
-        file ${{ github.event.inputs.ARCHITECTURE }}/vbmeta-disable-verification
-        
-    - name: Give Permissio and Run Patch
+        echo "Téléchargement du firmware depuis : ${{ github.event.inputs.FIRMWARE_URL }}"
+        wget -q --show-progress -O firmware.zip "${{ github.event.inputs.FIRMWARE_URL }}"
+
+    - name: Extract Firmware
       run: |
-        chmod +x ${{ github.event.inputs.ARCHITECTURE }}/vbmeta-disable-verification
-        ./${{ github.event.inputs.ARCHITECTURE }}/vbmeta-disable-verification vbmeta.img
+        # Cherche le fichier zip du firmware (téléchargé ou présent dans le repo)
+        FIRMWARE_FILE=$(find . -maxdepth 2 -name "*.zip" | grep -v ".github" | head -n 1)
+        if [ -z "$FIRMWARE_FILE" ]; then
+          echo "Aucun fichier firmware .zip trouvé !"
+          exit 1
+        fi
+        echo "Firmware trouvé : $FIRMWARE_FILE"
+        echo "FIRMWARE_FILE=$FIRMWARE_FILE" >> $GITHUB_ENV
+
+        mkdir -p firmware_extracted
+        unzip -q "$FIRMWARE_FILE" -d firmware_extracted/ || 7z x "$FIRMWARE_FILE" -ofirmware_extracted/
+        echo "Contenu extrait :"
+        find firmware_extracted/ -type f | sort
+
+    - name: Locate All VBMeta Images
+      run: |
+        echo "Recherche de toutes les images vbmeta..."
+        VBMETA_FILES=$(find firmware_extracted/ -type f -iname "vbmeta*.img" | sort)
+
+        if [ -z "$VBMETA_FILES" ]; then
+          echo "Aucune image vbmeta trouvée dans le firmware !"
+          exit 1
+        fi
+
+        echo "Images vbmeta trouvées :"
+        echo "$VBMETA_FILES"
+
+        # Copie dans le dossier de travail à la racine
+        mkdir -p vbmeta_to_patch
+        echo "$VBMETA_FILES" | while read f; do
+          cp "$f" vbmeta_to_patch/
+          echo "Copié : $(basename $f)"
+        done
+
+        # Sauvegarde la liste pour les étapes suivantes
+        ls vbmeta_to_patch/ > vbmeta_list.txt
+        echo "Liste finale :"
+        cat vbmeta_list.txt
+
+    - name: Verify Patch Binary
+      run: |
+        PATCHER="${{ github.event.inputs.ARCHITECTURE }}/vbmeta-disable-verification"
+        if [ ! -f "$PATCHER" ]; then
+          echo "Binaire de patch introuvable : $PATCHER"
+          exit 1
+        fi
+        file "$PATCHER"
+        chmod +x "$PATCHER"
+
+    - name: Patch All VBMeta Images
+      run: |
+        PATCHER="${{ github.event.inputs.ARCHITECTURE }}/vbmeta-disable-verification"
+        mkdir -p vbmeta_patched
+        SUCCESS=0
+        FAIL=0
+
+        while read -r IMGNAME; do
+          SRC="vbmeta_to_patch/$IMGNAME"
+          DEST="vbmeta_patched/$IMGNAME"
+          cp "$SRC" "$DEST"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Patching : $IMGNAME"
+          if ./"$PATCHER" "$DEST"; then
+            echo "✓ Succès : $IMGNAME"
+            SUCCESS=$((SUCCESS + 1))
+          else
+            echo "✗ Échec  : $IMGNAME"
+            FAIL=$((FAIL + 1))
+          fi
+        done < vbmeta_list.txt
+
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Résultat : $SUCCESS patchés avec succès, $FAIL échoués"
+        ls -lh vbmeta_patched/
+
+        if [ "$SUCCESS" -eq 0 ]; then
+          echo "Aucune image patchée avec succès !"
+          exit 1
+        fi
+
+    - name: Repack Patched VBMeta into ZIP
+      run: |
+        cd vbmeta_patched
+        zip -j ../vbmeta_patched_km4.zip *.img
+        cd ..
+        echo "Archive créée :"
+        ls -lh vbmeta_patched_km4.zip
+        unzip -l vbmeta_patched_km4.zip
+
+    - name: Generate Release Notes
+      run: |
+        echo "# Patched VBMeta — Tecno KM4 SPRD" > release_notes.md
+        echo "" >> release_notes.md
+        echo "## Images patchées" >> release_notes.md
+        while read -r img; do
+          echo "- \`$img\`" >> release_notes.md
+        done < vbmeta_list.txt
+        echo "" >> release_notes.md
+        echo "## Infos" >> release_notes.md
+        echo "- Architecture du patcher : \`${{ github.event.inputs.ARCHITECTURE }}\`" >> release_notes.md
+        echo "- Date : $(date -u '+%Y-%m-%d %H:%M UTC')" >> release_notes.md
+        echo "- Run ID : \`${{ github.run_id }}\`" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "## Flash" >> release_notes.md
+        echo "Flashez chaque image \`.img\` sur sa partition correspondante via fastboot :" >> release_notes.md
+        echo '```' >> release_notes.md
+        while read -r img; do
+          PART="${img%.img}"
+          echo "fastboot flash $PART $img" >> release_notes.md
+        done < vbmeta_list.txt
+        echo '```' >> release_notes.md
+        cat release_notes.md
 
     - name: Upload to Release
-      uses: ncipollo/release-action@v1.12.0
+      uses: ncipollo/release-action@v1.14.0
       with:
-        artifacts: vbmeta.img
-        Name: Patched VBMeta
+        artifacts: "vbmeta_patched_km4.zip,vbmeta_patched/*.img"
+        name: "Patched VBMeta — Tecno KM4 SPRD"
         draft: false
         prerelease: true
-        tag: ${{ github.run_id }}
+        tag: "vbmeta-km4-${{ github.run_id }}"
         token: ${{ secrets.GITHUB_TOKEN }}
-        body: |
-          Your vbmeta image are now ready!
-          Flash it now.
+        bodyFile: release_notes.md
 
-    - name: Link to Release
+    - name: Release Link
       run: |
-        echo "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${{ github.run_id }}"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Release disponible :"
+        echo "https://github.com/${GITHUB_REPOSITORY}/releases/tag/vbmeta-km4-${{ github.run_id }}"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
